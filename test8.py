@@ -1,7 +1,7 @@
 import sys
 import logging
 from pyspark.context import SparkContext
-from pyspark.sql.functions import col, sum as spark_sum, count, when
+from pyspark.sql.functions import col, sum as spark_sum, count, when, lit
 from awsglue.context import GlueContext
 from awsglue.job import Job
 from awsglue.utils import getResolvedOptions
@@ -16,7 +16,8 @@ spark = glueContext.spark_session
 job = Job(glueContext)
 job.init(args['JOB_NAME'], args)
 
-# Enable Spark ANSI SQL strict arithmetic compliance
+# ANSI strict mode is intentionally enabled.
+# All division expressions MUST guard against zero denominators explicitly.
 spark.conf.set("spark.sql.ansi.enabled", "true")
 
 logger.info("Reading user clickstream session logs...")
@@ -32,6 +33,15 @@ clickstream_data = [
 schema = ["region", "campaign", "conversions", "bounce_count"]
 click_df = spark.createDataFrame(clickstream_data, schema)
 
+# Data quality check: log a warning when zero-bounce rows are present so that
+# zero-denominator conditions are visible before aggregation.
+zero_bounce_count = click_df.filter(col("bounce_count") == 0).count()
+if zero_bounce_count > 0:
+    logger.warning(
+        f"{zero_bounce_count} row(s) with bounce_count=0 detected "
+        "— efficiency_ratio will be NULL for these cohorts."
+    )
+
 logger.info("Aggregating marketing conversions by regional cohort...")
 
 agg_cohorts = click_df.groupBy("region", "campaign").agg(
@@ -42,11 +52,18 @@ agg_cohorts = click_df.groupBy("region", "campaign").agg(
 
 logger.info("Computing conversion-to-bounce index...")
 
-# FAILS HERE: When total_bounces is 0, ANSI compliance raises SparkArithmeticException: Division by zero
+# Guard against division by zero: when total_bounces is 0, return NULL instead
+# of raising a SparkArithmeticException under ANSI strict arithmetic mode.
 conversion_metric_df = agg_cohorts.withColumn(
     "efficiency_ratio",
-    col("total_conversions") / col("total_bounces")
+    when(col("total_bounces") == 0, lit(None))
+    .otherwise(col("total_conversions") / col("total_bounces"))
 )
 
-conversion_metric_df.show()
+try:
+    conversion_metric_df.show()
+except Exception as e:
+    logger.error(f"Failed to display conversion_metric_df: {e}")
+    raise
+
 job.commit()
